@@ -55,9 +55,11 @@ jobs:
           pip install pip-audit==2.9.0
           status=0
           for f in $(git ls-files '*requirements*.txt'); do
+            out="audit-$(echo $f | tr / _).md"
             echo "::group::$f"
-            pip-audit -r "$f" --desc --format markdown --output "audit-$(echo $f | tr / _).md" || status=1
-            cat "audit-$(echo $f | tr / _).md"; echo "::endgroup::"
+            pip-audit -r "$f" --desc --format markdown --output "$out" || status=1
+            [ -f "$out" ] && cat "$out" || echo "No known vulnerabilities found" | tee "$out"
+            echo "::endgroup::"
           done
           exit $status
       - if: always()
