@@ -1,0 +1,27 @@
+# gitleaks config: default rules + a custom rule + a NARROW allowlist.
+# Every allowlist entry is a decision to defend in review: allow the specific
+# fake value, never a whole file or folder (a real key added there later would be missed).
+title = "sil-lab"
+
+[extend]
+useDefault = true
+
+# Default rules don't understand Kong's declarative config, so the JWT secret
+# in gateway/kong.yml went undetected. Custom rule closes that gap.
+[[rules]]
+id = "kong-declarative-credential"
+description = "Credential in Kong declarative config (jwt_secrets / keyauth_credentials)"
+regex = '''(?m)^\s*-?\s*(?:secret|key)\s*:\s*['"]?([A-Za-z0-9_\-]{16,})['"]?\s*$'''
+path = '''(?i)kong.*\.ya?ml$'''
+secretGroup = 1
+keywords = ["secret", "key"]
+
+[allowlist]
+description = "Lab placeholders and synthetic test fixtures only"
+regexTarget = "match"
+regexes = [
+  '''CHANGE_ME_lab_only''',          # lab placeholder values, documented in README
+  '''AKIAABCDEFGHIJKLMNOP''',        # fake AWS key used to test the guardrail's own secret detector
+  '''%TOKEN%''',                     # shell variable in DEMO.md, not a token
+  '''lab-issuer''',                  # JWT 'iss' claim name, not a secret
+]

@@ -1,0 +1,129 @@
+# Section 1B Q2 + Q6: security gates on every push and pull request.
+# Order = cheapest first. Any ERROR blocks the merge (set as required checks in branch protection).
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }          # full history: a key deleted in a later commit is still leaked
+      - name: Install gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz gitleaks
+      - name: Scan full git history
+        run: ./gitleaks git . --config .gitleaks.toml --redact --no-banner -v --report-format sarif --report-path gitleaks.sarif
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: gitleaks-report, path: gitleaks.sarif }
+
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container: semgrep/semgrep:1.181.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full report (stock rulesets + our AI-code rules)
+        run: semgrep scan --metrics=off --config p/python --config p/owasp-top-ten --config .semgrep/ --sarif -o semgrep.sarif
+      - name: Gate - fail on ERROR severity only (WARNING = human review)
+        run: semgrep scan --metrics=off --config p/python --config p/owasp-top-ten --config .semgrep/ --severity ERROR --error
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: semgrep-report, path: semgrep.sarif }
+
+  sca:
+    name: SCA + hallucinated packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Do the packages exist? (slopsquatting / AI hallucination)
+        run: python scripts/check_deps_exist.py
+      - name: Known vulnerabilities, including transitive deps (pip-audit, OSV + PyPI advisory data)
+        run: |
+          pip install pip-audit==2.9.0
+          status=0
+          for f in $(git ls-files '*requirements*.txt'); do
+            echo "::group::$f"
+            pip-audit -r "$f" --desc --format markdown --output "audit-$(echo $f | tr / _).md" || status=1
+            cat "audit-$(echo $f | tr / _).md"; echo "::endgroup::"
+          done
+          exit $status
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: sca-report, path: "audit-*.md" }
+
+  abuse-tests:
+    name: Guardrail unit + abuse-case tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - working-directory: ai-proxy
+        run: |
+          pip install -r requirements.txt pytest
+          pytest -v test_guardrails.py test_abuse_cases.py
+
+  dast:
+    name: DAST (OWASP ZAP) - WAF ${{ matrix.waf }}
+    needs: [secrets, sast]               # don't spend 10 minutes scanning code that already failed
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # On            = what an attacker sees in production (WAF blocking)
+        # DetectionOnly = the APIs' own weaknesses, normally hidden behind the WAF
+        waf: [On, DetectionOnly]
+    env:
+      MODSEC_RULE_ENGINE: ${{ matrix.waf }}
+      API_KEY: CHANGE_ME_lab_only_api_key   # lab placeholder; production = repo secret
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the lab
+        run: |
+          docker compose up -d --build
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "x-api-key: $API_KEY" http://localhost:8080/v1/appointments) && [ "$code" = "200" ] && break
+            sleep 3
+          done
+          echo "lab answered HTTP $code"; [ "$code" = "200" ]
+      - name: ZAP full scan (authenticated via API-key header)
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          target: http://localhost:8080/v1/appointments
+          rules_file_name: zap/rules.tsv
+          allow_issue_writing: false
+          artifact_name: zap-report-waf-${{ matrix.waf }}
+          # -I: WARN rules don't fail the build, only FAIL rules in zap/rules.tsv do
+          cmd_options: >-
+            -I -j
+            -z "-config replacer.full_list(0).description=apikey
+                -config replacer.full_list(0).enabled=true
+                -config replacer.full_list(0).matchtype=REQ_HEADER
+                -config replacer.full_list(0).matchstr=x-api-key
+                -config replacer.full_list(0).regex=false
+                -config replacer.full_list(0).replacement=${{ env.API_KEY }}"
+      - name: WAF blocks during the scan (evidence for the report)
+        if: always()
+        run: |
+          echo "403 responses from WAF: $(docker compose logs waf 2>/dev/null | grep -c '"http_code":403' || true)"
+          docker compose logs waf > waf-${{ matrix.waf }}.log 2>&1
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: waf-log-${{ matrix.waf }}
+          path: waf-*.log
+      - if: always()
+        run: docker compose down -v

@@ -1,0 +1,52 @@
+# Kong Gateway, DB-less declarative config.
+# Every request: WAF (ModSecurity + OWASP CRS, in front) -> Kong (auth, rate limits, size limits) -> API
+_format_version: "3.0"
+
+services:
+  - name: patients-api
+    url: http://patients-api:8000/patients
+    routes:
+      - name: patients
+        paths: ["/v1/patients"]
+        strip_path: true
+    plugins:
+      - name: jwt                      # strong auth for the PHI API
+      - name: acl
+        config: { allow: ["clinicians"] }
+      - name: rate-limiting
+        config: { minute: 30, policy: local, limit_by: consumer }
+      - name: request-size-limiting
+        config: { allowed_payload_size: 1, size_unit: kilobytes }
+
+  - name: appointments-api
+    url: http://appointments-api:8000/appointments
+    routes:
+      - name: appointments
+        paths: ["/v1/appointments"]
+        strip_path: true
+    plugins:
+      - name: key-auth                 # simpler API-key auth for a lower-risk API
+        config: { key_names: ["x-api-key"], hide_credentials: true }
+      - name: rate-limiting
+        config: { minute: 120, policy: local, limit_by: consumer }
+
+plugins:                               # global
+  - name: correlation-id
+    config: { header_name: X-Request-ID, generator: uuid, echo_downstream: true }
+  - name: response-transformer
+    config:
+      remove: { headers: ["Server", "X-Powered-By", "Via"] }
+  - name: file-log
+    config: { path: /dev/stdout, reopen: false }   # JSON access logs -> SIEM
+
+consumers:
+  - username: dr-wanjiku
+    jwt_secrets:
+      - key: lab-issuer                # 'iss' claim the token must carry
+        algorithm: HS256
+        secret: CHANGE_ME_lab_only_secret_min_32_chars_long
+    acls:
+      - group: clinicians
+  - username: booking-portal
+    keyauth_credentials:
+      - key: CHANGE_ME_lab_only_api_key

@@ -1,0 +1,66 @@
+# Section 1A lab. Fits in ~1.5 GB RAM. Run: docker compose up -d --build
+# Traffic: [Cloudflare edge WAF] -> cloudflared tunnel -> ModSecurity WAF -> Kong -> APIs
+#          internal apps -> ai-proxy (guardrails) -> Enterprise LLM
+name: sil-lab
+
+services:
+  waf:
+    image: owasp/modsecurity-crs:nginx-alpine
+    ports: ["8080:8080"]                 # the ONLY published port (the edge)
+    environment:
+      BACKEND: http://kong:8000
+      PARANOIA: "2"
+      BLOCKING_PARANOIA: "2"            # CRS 4 name for the same setting
+      ANOMALY_INBOUND: "5"
+      ANOMALY_OUTBOUND: "4"
+      MODSEC_RULE_ENGINE: "${MODSEC_RULE_ENGINE:-On}"   # CI sets DetectionOnly for the 2nd DAST pass
+      MODSEC_AUDIT_LOG_FORMAT: JSON
+      MODSEC_AUDIT_LOG: /dev/stdout
+      ALLOWED_METHODS: "GET POST OPTIONS"
+      ALLOWED_REQUEST_CONTENT_TYPE: "|application/json|"
+    depends_on: [kong]
+    networks: [edge, internal]
+
+  kong:
+    image: kong:3.8
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      KONG_ADMIN_LISTEN: 127.0.0.1:8001  # admin API never exposed
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_TRUSTED_IPS: 0.0.0.0/0
+      KONG_REAL_IP_HEADER: X-Forwarded-For
+      KONG_HEADERS: "off"                # hide Kong version headers
+    volumes: ["./gateway/kong.yml:/kong/kong.yml:ro"]
+    networks: [internal]
+
+  patients-api:
+    build: ./apis/patients
+    networks: [internal]
+  appointments-api:
+    build: ./apis/appointments
+    networks: [internal]
+
+  ai-proxy:
+    build: ./ai-proxy
+    ports: ["127.0.0.1:8090:8000"]       # internal tools only, never public
+    environment:
+      UPSTREAM_URL: ${UPSTREAM_URL:-}
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
+    networks: [internal, egress]
+
+  # Optional: expose the WAF via a Cloudflare Tunnel (no open inbound ports on your machine).
+  # Create the tunnel in Cloudflare Zero Trust, set CF_TUNNEL_TOKEN in .env, then:
+  #   docker compose --profile cloudflare up -d
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment: { TUNNEL_TOKEN: "${CF_TUNNEL_TOKEN:-}" }
+    profiles: [cloudflare]
+    networks: [edge]
+
+networks:
+  edge: {}
+  internal: { internal: true }           # APIs and Kong have NO internet access
+  egress: {}                             # only the AI proxy can reach the LLM provider

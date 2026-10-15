@@ -1,0 +1,109 @@
+# Custom Semgrep rules for flaws AI coding assistants commonly produce (Section 1B Q6).
+# Stock rulesets (p/python, p/owasp-top-ten) catch known bug patterns; these target
+# project-specific logic: PHI logging, fail-open guardrails, unchecked LLM output.
+# Severity ERROR blocks the merge; WARNING is reported for human review.
+rules:
+  - id: jwt-signature-not-verified
+    languages: [python]
+    severity: ERROR
+    message: JWT decoded without verifying the signature. Anyone can forge a token.
+    pattern-either:
+      - pattern: |
+          jwt.decode(..., options={..., "verify_signature": False, ...}, ...)
+      - pattern: jwt.decode(..., algorithms=[..., "none", ...], ...)
+    metadata: { cwe: "CWE-347", owasp: "A07:2021" }
+
+  - id: tls-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: TLS certificate verification disabled. Traffic (and PHI) can be intercepted.
+    pattern-either:
+      - pattern: requests.$M(..., verify=False, ...)
+      - pattern: httpx.$M(..., verify=False, ...)
+      - pattern: httpx.AsyncClient(..., verify=False, ...)
+      - pattern: httpx.Client(..., verify=False, ...)
+    metadata: { cwe: "CWE-295" }
+
+  - id: llm-output-executed
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Model output reaches eval/exec/shell/SQL. An LLM response is untrusted input
+      (OWASP LLM05 Improper Output Handling); a prompt injection becomes code execution.
+    mode: taint
+    pattern-sources:
+      - pattern: $R.json()["choices"]
+      - pattern: $X["choices"][$I]["message"]["content"]
+      - pattern: $C.chat.completions.create(...)
+    pattern-sinks:
+      - pattern: eval(...)
+      - pattern: exec(...)
+      - pattern: os.system(...)
+      - pattern: subprocess.$F(..., shell=True, ...)
+      - pattern: $CUR.execute($Q, ...)
+    metadata: { cwe: "CWE-94", owasp-llm: "LLM05" }
+
+  - id: prompt-or-body-logged
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Prompt or request body written to logs. Prompts can hold PHI, and logs flow to
+      the SIEM and backups where they are not protected as health records (Kenya DPA s.41).
+    patterns:
+      - pattern-either:
+          - pattern: $LOG.$LVL(..., <... $V ...>, ...)
+          - pattern: print(..., <... $V ...>, ...)
+      - metavariable-regex:
+          metavariable: $LVL
+          regex: ^(debug|info|warning|error|exception|critical)$
+      - metavariable-regex:
+          metavariable: $V
+          regex: ^(prompt|messages|body|payload|raw_body)$
+
+  - id: guardrail-fails-open
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Exception handler around a security check lets the request through. Guardrails
+      must fail closed: if the scanner errors, block.
+    pattern-either:
+      - pattern: |
+          try:
+              ...
+              $R = $SCAN(...)
+              ...
+          except $E:
+              return True
+      - pattern: |
+          try:
+              ...
+              $R = $SCAN(...)
+              ...
+          except $E:
+              pass
+    metadata: { cwe: "CWE-636" }
+
+  - id: path-id-without-caller-check
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Endpoint returns a record by ID from the URL without checking the caller may see
+      it (IDOR / BOLA, OWASP API1). Gateway auth proves WHO the caller is, not that
+      THIS patient is theirs. Review: add an ownership or role check.
+    patterns:
+      - pattern: |
+          @$APP.get($PATH)
+          def $F(..., $ID: str, ...):
+              ...
+      - metavariable-regex:
+          metavariable: $PATH
+          regex: .*\{.*_?id\}.*
+      - pattern-not: |
+          @$APP.get($PATH)
+          def $F(..., $ID: str, ..., $U = Depends(...), ...):
+              ...
+      - pattern-not: |
+          @$APP.get($PATH)
+          def $F(..., $U = Depends(...), ..., $ID: str, ...):
+              ...
+    metadata: { cwe: "CWE-639", owasp-api: "API1:2023" }

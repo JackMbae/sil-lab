@@ -1,0 +1,23 @@
+# Developer-side gates (Section 1B Q2): catch secrets and invented packages BEFORE they
+# leave the laptop. CI re-runs the same checks, because pre-commit can be skipped (--no-verify).
+# Setup once:  pip install pre-commit && pre-commit install
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks                    # scans only the staged changes; uses .gitleaks.toml
+
+  - repo: local
+    hooks:
+      - id: deps-exist
+        name: requirements exist on PyPI (AI-hallucinated package check)
+        entry: python scripts/check_deps_exist.py
+        language: system
+        files: requirements.*\.txt$
+        pass_filenames: true
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: detect-private-key
+      - id: check-added-large-files
