@@ -1,6 +1,7 @@
 <!--
   Section 1B Q3: custom rules for a NEW log source (AI guardrail proxy audit log).
   Wazuh has no built-in knowledge of this app, so we write the parsing (JSON decoder) and the detections.
+  Note: Wazuh maps the JSON key "user" to its built-in dstuser field, so rules use $(dstuser) / same_user.
   Scalars (service, event) are matched as decoded fields; findings/reason are matched on the raw line,
   which works whether Wazuh stores the findings array as a list or a string.
 -->
@@ -9,20 +10,20 @@
   <rule id="100400" level="3">
     <decoded_as>json</decoded_as>
     <field name="service">^ai-proxy$</field>
-    <description>AI proxy: $(event) (user $(user))</description>
+    <description>AI proxy: $(event) (user $(dstuser))</description>
   </rule>
 
   <rule id="100401" level="5">
     <if_sid>100400</if_sid>
     <field name="event">^blocked$</field>
-    <description>AI proxy blocked a request (user $(user))</description>
+    <description>AI proxy blocked a request (user $(dstuser))</description>
     <group>ai_guardrail_block,</group>
   </rule>
 
   <rule id="100402" level="8">
     <if_sid>100401</if_sid>
     <match>"PHI:</match>
-    <description>PHI blocked from leaving the network via AI tool (user $(user))</description>
+    <description>PHI blocked from leaving the network via AI tool (user $(dstuser))</description>
     <mitre><id>T1567</id></mitre>
     <group>ai_guardrail_block,phi,</group>
   </rule>
@@ -30,14 +31,14 @@
   <rule id="100403" level="10">
     <if_sid>100401</if_sid>
     <match>PROMPT_INJECTION</match>
-    <description>Prompt injection attempt against AI tool (user $(user))</description>
+    <description>Prompt injection attempt against AI tool (user $(dstuser))</description>
     <group>ai_guardrail_block,</group>
   </rule>
 
   <rule id="100404" level="10">
     <if_sid>100401</if_sid>
     <match>"SECRET:</match>
-    <description>Credential or secret pasted into AI prompt (user $(user)) - rotate it</description>
+    <description>Credential or secret pasted into AI prompt (user $(dstuser)) - rotate it</description>
     <mitre><id>T1552</id></mitre>
     <group>ai_guardrail_block,</group>
   </rule>
@@ -45,14 +46,14 @@
   <rule id="100405" level="7">
     <if_sid>100401</if_sid>
     <match>UNINSPECTABLE_CONTENT</match>
-    <description>AI request with content the guardrail cannot inspect was refused (user $(user))</description>
+    <description>AI request with content the guardrail cannot inspect was refused (user $(dstuser))</description>
     <group>ai_guardrail_block,</group>
   </rule>
 
   <rule id="100406" level="12" frequency="5" timeframe="120">
     <if_matched_group>ai_guardrail_block</if_matched_group>
-    <same_field>user</same_field>
-    <description>Repeated AI guardrail blocks for $(user): possible bulk PHI exfiltration or guardrail probing</description>
+    <same_user />
+    <description>Repeated AI guardrail blocks for $(dstuser): possible bulk PHI exfiltration or guardrail probing</description>
     <mitre><id>T1567</id></mitre>
     <group>ai_guardrail_block,</group>
   </rule>
