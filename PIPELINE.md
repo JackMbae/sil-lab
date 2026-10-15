@@ -22,7 +22,7 @@
    - `sast`: passes the gate, but the report has a **WARNING** for IDOR on `/patients/{patient_id}`
    - `secrets`: green
    - `dast`: runs because secrets + SAST passed; download the `zap-report-*` artifacts
-3. Pre-commit locally: `pip install pre-commit && pre-commit install`, then try committing a file containing `LLM_API_KEY = "f3a9c2e17b4d58a0c6e2f19b7d3a4c58"` and screenshot the block. Don't push it.
+3. Pre-commit locally: `pip install pre-commit && pre-commit install`, then generate a random fake key and try to commit it (PowerShell): `"LLM_API_KEY = '$(-join (1..32 | % { '0123456789abcdef'[(Get-Random 16)] }))'" | Out-File -Encoding ascii fake_secret.py; git add fake_secret.py; git commit -m test`. Screenshot the block, then delete `fake_secret.py`.
 4. **Fix and go green** (your own work, this is the story for the write-up):
    - SCA: bump fastapi to a release that allows a patched starlette, rebuild, re-run tests.
    - Abuse tests: make `main.py` extract text from list-form content, reject content types it can't inspect (fail closed), scan the messages joined with no separator as well as each one, and return 400 for malformed messages.
