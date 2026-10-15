@@ -121,17 +121,18 @@ jobs:
             sleep 3
           done
           echo "authenticated request returned HTTP $code"; [ "$code" = "200" ]
-          python -m http.server 9999 --directory zap >/dev/null 2>&1 &
 
       - name: ZAP API scan (every endpoint, method and parameter from the spec)
         # ZAP_AUTH_HEADER / ZAP_AUTH_HEADER_VALUE: ZAP adds the credential to every request
         # -I: WARN rules don't fail the build, only FAIL rules in zap/rules.tsv do
         run: |
-          mkdir -p zap-out && cp zap/rules.tsv zap-out/ && chmod -R 777 zap-out
+          # Spec passed as a LOCAL FILE: ZAP then targets the spec's own server (http://localhost:8080/v1).
+          # Fetching it from a URL made ZAP attack the host serving the file instead (found via the coverage check).
+          mkdir -p zap-out && cp zap/rules.tsv zap/${{ matrix.api }}-openapi.json zap-out/ && chmod -R 777 zap-out
           docker run --rm --network host -v "$PWD/zap-out:/zap/wrk:rw" \
             -e ZAP_AUTH_HEADER="$AUTH_HEADER" -e ZAP_AUTH_HEADER_VALUE="$AUTH_VALUE" \
             ghcr.io/zaproxy/zaproxy:stable \
-            zap-api-scan.py -t http://localhost:9999/${{ matrix.api }}-openapi.json -f openapi \
+            zap-api-scan.py -t /zap/wrk/${{ matrix.api }}-openapi.json -f openapi \
               -c rules.tsv -I -r report.html -w report.md -J report.json
 
       - if: always()
