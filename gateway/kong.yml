@@ -36,6 +36,8 @@ plugins:                               # global
   - name: response-transformer
     config:
       remove: { headers: ["Server", "X-Powered-By", "Via"] }
+      # Found by the ZAP scan: PHI responses were cacheable and lacked nosniff
+      add: { headers: ["X-Content-Type-Options:nosniff", "Cache-Control:no-store"] }
   - name: file-log
     config: { path: /dev/stdout, reopen: false }   # JSON access logs -> SIEM
 

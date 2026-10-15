@@ -115,6 +115,10 @@ jobs:
 
       - name: Start the lab and confirm auth works BEFORE scanning
         run: |
+          # CI copy only: lift Kong's per-minute limits so ZAP tests the API, not the throttle.
+          # (Run #6: the patients scan hit the 30/min limit and most attacks came back 429.
+          #  Rate limiting itself is proven separately by lab test 6.)
+          sed -i 's/minute: [0-9]*,/minute: 100000,/' gateway/kong.yml
           docker compose up -d --build
           for i in $(seq 1 30); do
             code=$(curl -s -o /dev/null -w '%{http_code}' -H "$AUTH_HEADER: $AUTH_VALUE" http://localhost:8080/v1/${{ matrix.api }}${{ matrix.api == 'patients' && '/P001' || '' }}) && [ "$code" = "200" ] && break
