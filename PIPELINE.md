@@ -8,7 +8,7 @@
 | SCA | CI | pip-audit (OSV + PyPI advisories) | known CVEs **including transitive deps** | any vuln |
 | SAST | CI | Semgrep: `p/python`, `p/owasp-top-ten`, `.semgrep/ai-code-rules.yml` | injection, unverified JWT, TLS off, LLM output executed, PHI logged, fail-open guardrail, IDOR | ERROR only |
 | Abuse tests | CI | pytest `ai-proxy/test_abuse_cases.py` | guardrail logic bypasses | any failure |
-| DAST | CI, after secrets + SAST | OWASP ZAP full scan, twice: WAF On / DetectionOnly | runtime vulns, headers, CORS | FAIL rules in `zap/rules.tsv` |
+| DAST | CI, after secrets + SAST | OWASP ZAP **API scan** driven by each API's OpenAPI spec, authenticated, x2 APIs x2 WAF modes + coverage check | runtime vulns, headers, caching, CORS | FAIL rules in `zap/rules.tsv` |
 
 ## Run it (step by step, screenshot each)
 1. Create a **private** GitHub repo `sil-lab`, then from the lab folder:
@@ -22,7 +22,7 @@
    - `sast`: passes the gate, but the report has a **WARNING** for IDOR on `/patients/{patient_id}`
    - `secrets`: green
    - `dast`: runs because secrets + SAST passed; download the `zap-report-*` artifacts
-3. Pre-commit locally: `pip install pre-commit && pre-commit install`, then generate a random fake key and try to commit it (PowerShell): `"LLM_API_KEY = '$(-join (1..32 | % { '0123456789abcdef'[(Get-Random 16)] }))'" | Out-File -Encoding ascii fake_secret.py; git add fake_secret.py; git commit -m test`. Screenshot the block, then delete `fake_secret.py`.
+3. Pre-commit locally: `pip install pre-commit && pre-commit install`, then generate a random fake key and try to commit it (PowerShell): `"LLM_API_KEY = '$(-join (1..32 | % { '0123456789abcdef'[(Get-Random 16)] }))'" | Out-File -Encoding ascii fake_secret.py; git add fake_secret.py; git commit -m test`. Screenshot the block, then delete `fake_secret.py`. (No literal example key is written in this file: an earlier version had one and gitleaks caught it.)
 4. **Fix and go green** (your own work, this is the story for the write-up):
    - SCA: bump fastapi to a release that allows a patched starlette, rebuild, re-run tests.
    - Abuse tests: make `main.py` extract text from list-form content, reject content types it can't inspect (fail closed), scan the messages joined with no separator as well as each one, and return 400 for malformed messages.
@@ -47,6 +47,27 @@
   - **On** shows what an attacker sees in prod; most attack payloads get 403.
   - **DetectionOnly** shows what the WAF is hiding. Anything that only appears here is a real app bug **protected by one control**; fix it in code, don't rely on the WAF.
   - Headers (X-Content-Type-Options, Server leak, wildcard CORS) are WARN: real, low severity, matches the 1A findings.
+
+## DAST lesson from run #3 (use this in the write-up)
+The first DAST design (ZAP *full scan* with a spider) went **green, but proved almost nothing**:
+| Evidence in the report | Meaning |
+|---|---|
+| 93-96% of responses were 4xx, only 3-6% 2xx | ZAP was mostly hitting 404s (`/`, `/robots.txt`, `/sitemap.xml`), not the API |
+| 5 endpoints found, GET only | Spider can't discover JSON APIs: no POST, no parameters, no patients API at all |
+| WAF On and WAF DetectionOnly reports identical | Attacks never reached anything the WAF had to block, so the comparison was meaningless |
+| 0 High alerts | Absence of evidence, not evidence of absence |
+
+Fix: ZAP **API scan** fed the OpenAPI spec of each API (every endpoint, method, parameter), authenticated
+(API key / JWT), plus a **coverage check** in the job summary that counts how many requests reached the API.
+Rule: **never accept a clean DAST report without checking its coverage.**
+
+Real findings from that run, triaged:
+| Alert | Risk | Decision |
+|---|---|---|
+| Storable and Cacheable Content on `/v1/appointments` | Info | **Fix for PHI APIs**: add `Cache-Control: no-store` in Kong so proxies/browsers never cache patient data |
+| X-Content-Type-Options missing | Low | Fix: add `nosniff` header in Kong response-transformer (one line, all APIs) |
+| CSP / Permissions-Policy not set | Medium / Low | Accept for JSON-only APIs (no HTML rendered); required on any web front end |
+| User Agent Fuzzer | Info | No action: responses don't vary by client |
 
 ## Catching AI logic flaws (Q6), the strategy in one table
 | Layer | Control |

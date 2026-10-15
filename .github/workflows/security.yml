@@ -77,53 +77,94 @@ jobs:
           pytest -v test_guardrails.py test_abuse_cases.py
 
   dast:
-    name: DAST (OWASP ZAP) - WAF ${{ matrix.waf }}
-    needs: [secrets, sast]               # don't spend 10 minutes scanning code that already failed
+    name: DAST (ZAP API scan) - ${{ matrix.api }} - WAF ${{ matrix.waf }}
+    needs: [secrets, sast]               # don't spend minutes scanning code that already failed
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        api: [appointments, patients]
         # On            = what an attacker sees in production (WAF blocking)
         # DetectionOnly = the APIs' own weaknesses, normally hidden behind the WAF
         waf: [On, DetectionOnly]
     env:
       MODSEC_RULE_ENGINE: ${{ matrix.waf }}
-      API_KEY: CHANGE_ME_lab_only_api_key   # lab placeholder; production = repo secret
     steps:
       - uses: actions/checkout@v4
-      - name: Start the lab
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Export OpenAPI specs (ZAP's spider can't discover a JSON API)
+        run: |
+          pip install -r apis/patients/requirements.txt
+          python scripts/export_openapi.py
+
+      - name: Credentials for this API (lab placeholders; production = repo secrets)
+        run: |
+          if [ "${{ matrix.api }}" = "patients" ]; then
+            TOKEN=$(JWT_TTL=3600 python scripts/make_jwt.py)
+            echo "::add-mask::$TOKEN"
+            echo "AUTH_HEADER=Authorization" >> $GITHUB_ENV
+            echo "AUTH_VALUE=Bearer $TOKEN" >> $GITHUB_ENV
+          else
+            echo "AUTH_HEADER=x-api-key" >> $GITHUB_ENV
+            echo "AUTH_VALUE=CHANGE_ME_lab_only_api_key" >> $GITHUB_ENV
+          fi
+
+      - name: Start the lab and confirm auth works BEFORE scanning
         run: |
           docker compose up -d --build
           for i in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -H "x-api-key: $API_KEY" http://localhost:8080/v1/appointments) && [ "$code" = "200" ] && break
+            code=$(curl -s -o /dev/null -w '%{http_code}' -H "$AUTH_HEADER: $AUTH_VALUE" http://localhost:8080/v1/${{ matrix.api }}${{ matrix.api == 'patients' && '/P001' || '' }}) && [ "$code" = "200" ] && break
             sleep 3
           done
-          echo "lab answered HTTP $code"; [ "$code" = "200" ]
-      - name: ZAP full scan (authenticated via API-key header)
-        uses: zaproxy/action-full-scan@v0.12.0
-        with:
-          target: http://localhost:8080/v1/appointments
-          rules_file_name: zap/rules.tsv
-          allow_issue_writing: false
-          artifact_name: zap-report-waf-${{ matrix.waf }}
-          # -I: WARN rules don't fail the build, only FAIL rules in zap/rules.tsv do
-          cmd_options: >-
-            -I -j
-            -z "-config replacer.full_list(0).description=apikey
-                -config replacer.full_list(0).enabled=true
-                -config replacer.full_list(0).matchtype=REQ_HEADER
-                -config replacer.full_list(0).matchstr=x-api-key
-                -config replacer.full_list(0).regex=false
-                -config replacer.full_list(0).replacement=${{ env.API_KEY }}"
-      - name: WAF blocks during the scan (evidence for the report)
-        if: always()
+          echo "authenticated request returned HTTP $code"; [ "$code" = "200" ]
+          python -m http.server 9999 --directory zap >/dev/null 2>&1 &
+
+      - name: ZAP API scan (every endpoint, method and parameter from the spec)
+        # ZAP_AUTH_HEADER / ZAP_AUTH_HEADER_VALUE: ZAP adds the credential to every request
+        # -I: WARN rules don't fail the build, only FAIL rules in zap/rules.tsv do
         run: |
-          echo "403 responses from WAF: $(docker compose logs waf 2>/dev/null | grep -c '"http_code":403' || true)"
-          docker compose logs waf > waf-${{ matrix.waf }}.log 2>&1
+          mkdir -p zap-out && cp zap/rules.tsv zap-out/ && chmod -R 777 zap-out
+          docker run --rm --network host -v "$PWD/zap-out:/zap/wrk:rw" \
+            -e ZAP_AUTH_HEADER="$AUTH_HEADER" -e ZAP_AUTH_HEADER_VALUE="$AUTH_VALUE" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-api-scan.py -t http://localhost:9999/${{ matrix.api }}-openapi.json -f openapi \
+              -c rules.tsv -I -r report.html -w report.md -J report.json
+
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: waf-log-${{ matrix.waf }}
+          name: zap-${{ matrix.api }}-waf-${{ matrix.waf }}
+          path: zap-out/report.*
+
+      - name: Coverage check - did the attacks actually reach the API?
+        if: always()
+        run: |
+          docker compose logs --no-log-prefix kong > kong.log 2>&1
+          docker compose logs --no-log-prefix waf > waf-${{ matrix.api }}-${{ matrix.waf }}.log 2>&1
+          python - <<'PY' | tee -a $GITHUB_STEP_SUMMARY
+          import json, collections
+          kong = collections.Counter()
+          for line in open("kong.log", errors="ignore"):
+              try:
+                  r = json.loads(line[line.index("{"):])
+                  kong[r["response"]["status"]] += 1
+              except Exception:
+                  pass
+          waf403 = sum('"http_code":403' in l for l in open("waf-${{ matrix.api }}-${{ matrix.waf }}.log", errors="ignore"))
+          total = sum(kong.values())
+          print("### Coverage: ${{ matrix.api }} / WAF ${{ matrix.waf }}")
+          print(f"- Requests that reached Kong: **{total}**  (by status: {dict(sorted(kong.items()))})")
+          print(f"- Blocked by the WAF (403): **{waf403}**")
+          ok = sum(v for k, v in kong.items() if k < 300 or k == 422)
+          print(f"- Reached the API with valid auth (2xx/422): **{ok}**"
+                + ("  - LOW COVERAGE: check auth before trusting this report" if ok < 20 else ""))
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.api }}-waf-${{ matrix.waf }}
           path: waf-*.log
       - if: always()
         run: docker compose down -v
