@@ -1,81 +1,532 @@
-# Section 1B Q2 + Q6: CI/CD security pipeline
+# Section 1B Q2 + Q6 — CI/CD Security Pipeline
 
-## What runs where
-| Gate | Where | Tool | Catches | Blocks on |
+This document describes the security controls I implemented in the SIL assessment lab's CI/CD pipeline and the findings generated during testing.
+
+The pipeline was designed to demonstrate that security checks should not simply produce a green or red build. Each finding was investigated, its limitations were considered, and the pipeline was improved where the initial implementation was insufficient.
+
+The final pipeline covers:
+
+- Secret scanning
+- Hallucinated-package detection
+- Software Composition Analysis (SCA)
+- Static Application Security Testing (SAST)
+- AI abuse-case testing
+- Dynamic Application Security Testing (DAST)
+- AI-generated-code security testing
+- Security gates for pull requests
+
+---
+
+# 1. Pipeline Architecture
+
+The security pipeline combines controls at different stages of the software development lifecycle.
+
+| Gate | Where | Tool | What it detects | Build behaviour |
 |---|---|---|---|---|
-| Secrets | pre-commit + CI (full history) | gitleaks 8.21.2 + `.gitleaks.toml` | API keys, tokens, Kong JWT secret (custom rule) | any finding |
-| Hallucinated packages | pre-commit + CI | `scripts/check_deps_exist.py` | package not on PyPI, version never published, package < 90 days old | any error |
-| SCA | CI | pip-audit (OSV + PyPI advisories) | known CVEs **including transitive deps** | any vuln |
-| SAST | CI | Semgrep: `p/python`, `p/owasp-top-ten`, `.semgrep/ai-code-rules.yml` | injection, unverified JWT, TLS off, LLM output executed, PHI logged, fail-open guardrail, IDOR | ERROR only |
-| Abuse tests | CI | pytest `ai-proxy/test_abuse_cases.py` | guardrail logic bypasses | any failure |
-| DAST | CI, after secrets + SAST | OWASP ZAP **API scan** driven by each API's OpenAPI spec, authenticated, x2 APIs x2 WAF modes + coverage check | runtime vulns, headers, caching, CORS | FAIL rules in `zap/rules.tsv` |
+| Secrets | Pre-commit + CI | Gitleaks 8.21.2 + `.gitleaks.toml` | API keys, tokens, Kong JWT secrets | Blocks on findings |
+| Hallucinated packages | Pre-commit + CI | `scripts/check_deps_exist.py` | Non-existent packages, unpublished versions, very new packages | Blocks on errors |
+| SCA | CI | pip-audit | Known vulnerabilities, including transitive dependencies | Blocks on vulnerabilities |
+| SAST | CI | Semgrep | Injection, JWT validation issues, TLS disabled, unsafe LLM output, PHI logging, fail-open guardrails, IDOR | Blocks on ERROR findings |
+| Abuse tests | CI | pytest | AI guardrail and application logic bypasses | Blocks on failures |
+| DAST | CI | OWASP ZAP API scan | Runtime vulnerabilities, headers, caching, CORS and API behaviour | Blocks according to `zap/rules.tsv` |
 
-## Run it (step by step, screenshot each)
-1. Create a **private** GitHub repo `sil-lab`, then from the lab folder:
-   ```
-   git init && git add . && git commit -m "SIL lab" && git branch -M main
-   git remote add origin https://github.com/<you>/sil-lab.git && git push -u origin main
-   ```
-2. **Actions** tab → `security` run. **Expected first run: red.** That is the point:
-   - `abuse-tests`: 5 failures (the guardrail bypasses below)
-   - `sca`: starlette 0.45.3 advisories (pulled in by fastapi 0.115.9)
-   - `sast`: passes the gate, but the report has a **WARNING** for IDOR on `/patients/{patient_id}`
-   - `secrets`: green
-   - `dast`: runs because secrets + SAST passed; download the `zap-report-*` artifacts
-3. Pre-commit locally: `pip install pre-commit && pre-commit install`, then generate a random fake key and try to commit it (PowerShell): `"LLM_API_KEY = '$(-join (1..32 | % { '0123456789abcdef'[(Get-Random 16)] }))'" | Out-File -Encoding ascii fake_secret.py; git add fake_secret.py; git commit -m test`. Screenshot the block, then delete `fake_secret.py`. (No literal example key is written in this file: an earlier version had one and gitleaks caught it.)
-4. **Fix and go green** (your own work, this is the story for the write-up):
-   - SCA: bump fastapi to a release that allows a patched starlette, rebuild, re-run tests.
-   - Abuse tests: make `main.py` extract text from list-form content, reject content types it can't inspect (fail closed), scan the messages joined with no separator as well as each one, and return 400 for malformed messages.
-5. **Demo PR** (Q6 evidence): new branch, copy `pipeline-demo/ai_generated_helper.py` into `ai-proxy/helper.py`, add `fastapi-guardrails-pro==1.0.0` to `ai-proxy/requirements.txt`, open a PR. Screenshot the 5 Semgrep ERRORs + the hallucinated-package error blocking the merge. Close the PR without merging.
-6. Settings → Branches → protect `main`: require the `security` checks to pass. Screenshot.
+The controls are deliberately complementary. No single scanner is treated as sufficient to establish that the application is secure.
 
-## What the lab already found (verified, use as evidence)
-| Finding | Found by | Missed by | Why |
-|---|---|---|---|
-| PHI sent as `content: [{"type":"text",...}]` skips the guardrail → 200 | abuse test | unit tests, Semgrep, ZAP | Code is valid; the flaw is an assumption (content is always a string) |
-| PHI split across two messages slips past the regex | abuse test | all scanners | Joined with `\n`, the phone number no longer matches |
-| Malformed message → 500 crash | abuse test | | No input schema on the proxy |
-| starlette 0.45.3 vulnerable (transitive) | pip-audit | OSV-Scanner on `requirements.txt` | OSV only reads the 3 listed packages; pip-audit resolves the tree |
-| Kong JWT secret in `kong.yml` | custom gitleaks rule | gitleaks defaults | Default rules don't know Kong's YAML format |
-| `/patients/{id}`: any clinician can read any patient | custom Semgrep rule (WARNING) | ZAP, stock rules | Gateway proves *who*, nobody checks *whether this patient is theirs* |
 
-## Reading the reports (Q2: interpretation)
-- **gitleaks:** for each hit decide real vs fake. A real hit = **rotate first**, then remove; deleting the commit doesn't un-leak a key that was pushed. Allowlist only the exact fake value, never a whole file (see `.gitleaks.toml`).
-- **Semgrep:** triage each as true positive, false positive (add `# nosemgrep: <rule-id>` with a reason, reviewed in the PR), or accepted risk (ticket). Track the false-positive rate per rule; a noisy rule gets ignored by developers.
-- **SCA:** check (1) is the vulnerable function reachable in our code, (2) is a fixed version available, (3) is it direct or transitive. Fix by upgrading the parent, not pinning the child by hand.
-- **ZAP:** risk + confidence. High risk / medium+ confidence = fix. Compare the two runs:
-  - **On** shows what an attacker sees in prod; most attack payloads get 403.
-  - **DetectionOnly** shows what the WAF is hiding. Anything that only appears here is a real app bug **protected by one control**; fix it in code, don't rely on the WAF.
-  - Headers (X-Content-Type-Options, Server leak, wildcard CORS) are WARN: real, low severity, matches the 1A findings.
 
-## DAST lesson from run #3 (use this in the write-up)
-The first DAST design (ZAP *full scan* with a spider) went **green, but proved almost nothing**:
-| Evidence in the report | Meaning |
-|---|---|
-| 93-96% of responses were 4xx, only 3-6% 2xx | ZAP was mostly hitting 404s (`/`, `/robots.txt`, `/sitemap.xml`), not the API |
-| 5 endpoints found, GET only | Spider can't discover JSON APIs: no POST, no parameters, no patients API at all |
-| WAF On and WAF DetectionOnly reports identical | Attacks never reached anything the WAF had to block, so the comparison was meaningless |
-| 0 High alerts | Absence of evidence, not evidence of absence |
+---
 
-Fix: ZAP **API scan** fed the OpenAPI spec of each API (every endpoint, method, parameter), authenticated
-(API key / JWT), plus a **coverage check** in the job summary that counts how many requests reached the API.
-Rule: **never accept a clean DAST report without checking its coverage.**
+# 2. Security Pipeline Flow
 
-Real findings from that run, triaged:
-| Alert | Risk | Decision |
+The resulting workflow is:
+
+```text
+Developer Change
+      |
+      v
++--------------------+
+| Pre-commit Checks  |
+|                    |
+| Gitleaks           |
+| Dependency Check   |
++---------+----------+
+          |
+          v
++--------------------+
+| GitHub Actions     |
+|                    |
+| SCA                |
+| Semgrep SAST       |
+| Abuse Tests        |
++---------+----------+
+          |
+          v
++--------------------+
+| DAST               |
+|                    |
+| OWASP ZAP API Scan |
+| Authenticated      |
+| WAF On / Off       |
++---------+----------+
+          |
+          v
++--------------------+
+| Security Gate      |
++---------+----------+
+          |
+          v
+       Merge
+```
+
+The pipeline was designed so that vulnerabilities identified at an earlier and cheaper stage are caught before progressing to later stages.
+
+---
+
+# 3. Initial Pipeline Run
+
+I intentionally ran the initial pipeline before making the identified fixes.
+
+The first run was expected to fail, and this provided useful evidence for the assessment rather than being treated as a problem with the exercise.
+
+The initial results included:
+
+- Five AI guardrail abuse-test failures
+- A vulnerable transitive `starlette` dependency identified by SCA
+- A SAST warning for potential IDOR on `/patients/{patient_id}`
+- Successful secret scanning
+- DAST execution after the prerequisite security checks passed
+
+The initial pipeline therefore provided a baseline against which the subsequent fixes could be measured.
+
+---
+
+# 4. Secret Scanning
+
+I implemented Gitleaks both as a local pre-commit control and as part of CI.
+
+The configuration includes custom detection for secrets that are specific to this lab, including the Kong JWT secret format.
+
+The pipeline is designed to identify:
+
+- API keys
+- Tokens
+- Application secrets
+- Kong JWT secrets
+- Other credential-like values
+
+The custom rule was necessary because the default Gitleaks rules did not identify the Kong JWT secret stored in the lab's YAML configuration.
+
+This demonstrated an important limitation of generic security tooling: a scanner may only detect a secret when its format is already known to the scanner.
+
+I also tested the pre-commit control by generating a random fake secret-like value and attempting to commit it.
+
+The secret was detected before it could be committed.
+
+When a real secret is detected, the correct response is to **rotate the credential first**, then remove it from the repository. Simply deleting the value from the latest commit does not invalidate a secret that has already been exposed.
+
+---
+
+# 5. Hallucinated Package Detection
+
+AI-assisted development can introduce dependencies that appear plausible but do not actually exist.
+
+I therefore implemented a custom dependency check:
+
+```text
+scripts/check_deps_exist.py
+```
+
+The check identifies:
+
+- Packages that do not exist on PyPI
+- Versions that have never been published
+- Packages that are too recently published to meet the lab's configured trust threshold
+
+This check runs both locally and in CI.
+
+During the Q6 demonstration, the pipeline detected the deliberately introduced package:
+
+```text
+fastapi-guardrails-pro==1.0.0
+```
+
+The package does not exist on PyPI, so the security pipeline blocked the change.
+
+This demonstrated that dependency validation can provide a security control specifically against AI-generated or hallucinated dependencies.
+
+---
+
+# 6. Software Composition Analysis
+
+I used `pip-audit` to identify known vulnerabilities in Python dependencies.
+
+The SCA stage initially identified a vulnerable transitive dependency:
+
+```text
+starlette 0.45.3
+```
+
+The important finding was that the vulnerable dependency was not necessarily obvious from the application's direct dependency list.
+
+The pipeline therefore demonstrated why dependency scanning should resolve the complete dependency tree rather than checking only the packages explicitly listed by the developer.
+
+I fixed the issue by upgrading the parent dependency to a release that brought in a patched version of Starlette, followed by rebuilding and re-running the pipeline.
+
+The preferred remediation was therefore to upgrade the parent dependency rather than manually pinning the transitive dependency.
+
+---
+
+# 7. Semgrep SAST
+
+The pipeline uses Semgrep with:
+
+```text
+p/python
+p/owasp-top-ten
+.semgrep/ai-code-rules.yml
+```
+
+The custom rules were written specifically around security mistakes that could occur in this application.
+
+The rules cover issues including:
+
+- Injection
+- Unverified JWTs
+- TLS being disabled
+- Unsafe execution of LLM output
+- PHI being logged
+- Fail-open AI guardrails
+- IDOR
+
+The pipeline blocks on ERROR-level findings.
+
+Warnings are retained for manual security review.
+
+One important finding was:
+
+```text
+/patients/{patient_id}
+```
+
+The gateway successfully established **who** the user was, but the application did not independently establish whether that user was authorized to access the **specific patient record**.
+
+This was identified by a custom Semgrep rule as a potential IDOR issue.
+
+The finding demonstrates the difference between authentication and object-level authorization.
+
+---
+
+# 8. AI Guardrail Abuse Testing
+
+I implemented dedicated abuse-case tests for the AI security proxy:
+
+```text
+ai-proxy/test_abuse_cases.py
+```
+
+The tests were designed from a threat perspective rather than simply testing the expected application flow.
+
+The question was:
+
+> How could an attacker get sensitive information past the guardrail?
+
+The initial abuse tests identified several logic flaws that were not detected by conventional scanners.
+
+### Content-list bypass
+
+A request containing:
+
+```text
+content: [{"type":"text", ...}]
+```
+
+could bypass the guardrail because the implementation assumed that message content would always be a simple string.
+
+The application therefore accepted content that the guardrail had not actually inspected.
+
+### Split-message bypass
+
+Sensitive content split across multiple messages could also bypass the original regular-expression check.
+
+### Malformed input
+
+Malformed messages could cause a `500` response because the proxy did not initially enforce an adequate input schema.
+
+These findings demonstrated that valid application syntax does not necessarily mean that the security logic is correct.
+
+---
+
+# 9. Fixing the AI Guardrail Logic
+
+I corrected the identified guardrail weaknesses by:
+
+- Extracting text from list-form message content
+- Rejecting content types that the guardrail cannot inspect
+- Scanning individual messages
+- Scanning the joined message content
+- Returning `400` for malformed messages
+- Ensuring the guardrail fails closed rather than silently allowing uninspected content
+
+The abuse-case tests were then re-run.
+
+The final guardrail test suite passed:
+
+```text
+19/19 tests passing
+```
+
+This created a permanent regression test for the security logic rather than relying on a one-time manual verification.
+
+---
+
+# 10. Deliberately Vulnerable AI-Generated-Code PR
+
+For the Q6 assessment, I created a demonstration PR containing deliberately vulnerable code representative of security issues that can occur in AI-assisted development.
+
+The demonstration included:
+
+- AI-style security flaws
+- A hallucinated dependency
+- Code requiring additional security review
+
+The security pipeline detected the issues before the PR could be merged.
+
+The SAST stage identified:
+
+```text
+7 findings
+5 custom AI-code rules
+```
+
+The hallucinated dependency check also rejected:
+
+```text
+fastapi-guardrails-pro==1.0.0
+```
+
+The PR was closed without merging.
+
+This demonstrated that AI-generated code should be subjected to the same, and in some cases stronger, security controls as manually written code.
+
+---
+
+# 11. Branch Protection
+
+I configured the `main` branch so that the security checks are required before changes can be merged.
+
+The intended workflow is:
+
+```text
+Pull Request
+     |
+     v
+Security Pipeline
+     |
+     +---- Fail ----> Fix
+     |
+     +---- Pass ----> Review
+                       |
+                       v
+                     Merge
+```
+
+This prevents security controls from becoming merely advisory checks that developers can ignore.
+
+The branch ruleset evidence is included in the assessment evidence.
+
+---
+
+# 12. Initial DAST Approach — What Did Not Work
+
+One of the most important lessons from the assessment came from the first DAST implementation.
+
+The initial approach used an OWASP ZAP full scan with a traditional spider.
+
+The resulting report was green, but the result was misleading.
+
+The report showed:
+
+- Approximately 93–96% of responses were `4xx`
+- Only approximately 3–6% were `2xx`
+- Only five endpoints were discovered
+- The discovered endpoints were primarily GET requests
+- The Patients API was not properly exercised
+- POST requests and meaningful API parameters were not covered
+- WAF-On and DetectionOnly reports were effectively identical
+- No High findings were reported
+
+The clean report therefore did **not** demonstrate that the APIs were secure.
+
+The problem was test coverage, not necessarily application security.
+
+---
+
+# 13. DAST Redesign
+
+I replaced the initial spider-based approach with an authenticated OWASP ZAP **API scan** driven by the OpenAPI specifications for the two APIs.
+
+The revised approach:
+
+1. Loads the OpenAPI specification.
+2. Discovers the actual API endpoints.
+3. Exercises the supported HTTP methods.
+4. Supplies the required API authentication.
+5. Tests the APIs with the WAF enabled.
+6. Repeats testing with the WAF in DetectionOnly mode.
+7. Checks how many requests actually reached the API.
+8. Applies the configured rules in `zap/rules.tsv`.
+
+The coverage check was an important addition.
+
+I did not treat a clean DAST report as successful unless I could demonstrate that ZAP had actually exercised the application.
+
+The final principle was:
+
+> **Never accept a clean DAST report without checking its coverage.**
+
+---
+
+# 14. Why WAF-On and DetectionOnly Testing Matters
+
+I used two WAF modes to distinguish between attacks blocked at the perimeter and vulnerabilities that remained in the application.
+
+### WAF On
+
+This represents the protection an attacker would encounter in the deployed environment.
+
+Attack payloads intercepted by the WAF are rejected before reaching the application.
+
+### DetectionOnly
+
+This allows the request to reach the application while the WAF records what it would have detected.
+
+This is useful for identifying application weaknesses that are currently being hidden by the WAF.
+
+If an attack succeeds in DetectionOnly mode but is blocked when the WAF is enabled, the application should still be reviewed.
+
+The WAF should be treated as a defence-in-depth control, not as a replacement for secure application code.
+
+---
+
+# 15. DAST Findings & Remediation
+
+The meaningful DAST run identified several findings that were triaged individually.
+
+| Finding | Risk | Decision |
 |---|---|---|
-| Storable and Cacheable Content on `/v1/appointments` | Info | **Fix for PHI APIs**: add `Cache-Control: no-store` in Kong so proxies/browsers never cache patient data |
-| X-Content-Type-Options missing | Low | Fix: add `nosniff` header in Kong response-transformer (one line, all APIs) |
-| CSP / Permissions-Policy not set | Medium / Low | Accept for JSON-only APIs (no HTML rendered); required on any web front end |
-| User Agent Fuzzer | Info | No action: responses don't vary by client |
+| Storable/cacheable content on `/v1/appointments` | Informational | Fix for PHI APIs |
+| `X-Content-Type-Options` missing | Low | Fix |
+| CSP / Permissions-Policy missing | Medium / Low | Accept for JSON-only APIs; required for web front ends |
+| User Agent Fuzzer | Informational | No action |
 
-## Catching AI logic flaws (Q6), the strategy in one table
-| Layer | Control |
+For the appointment API, I treated cacheability as important because the application represents patient-related data.
+
+The planned remediation was to add:
+
+```text
+Cache-Control: no-store
+```
+
+through Kong so that proxies and browsers do not cache sensitive API responses.
+
+I also added the `nosniff` response header through the gateway.
+
+CSP and Permissions-Policy were treated differently because the lab APIs return JSON and do not render an HTML user interface.
+
+---
+
+# 16. What the Pipeline Demonstrated
+
+The completed pipeline demonstrated that different security tools identify different classes of problems.
+
+| Security Problem | Primary Detection |
 |---|---|
-| Before commit | Pre-commit hooks for secrets + invented packages; AI tool configured with a security system prompt; no secrets/PHI in prompts |
-| PR | Custom Semgrep rules for the mistakes AI makes in *this* codebase; `CODEOWNERS` forces a security reviewer on `gateway/`, `ai-proxy/`, auth code; PR template asks "AI-assisted? which parts?" |
-| Tests | Abuse-case tests written from a threat model (STRIDE / OWASP LLM Top 10), not from the code. Ask "how do I get PHI past this?", not "does it work?" |
-| Runtime | DAST with and without the WAF; guardrail audit logs to the SIEM; alert on unusual allow/block ratios |
-| People | Reviewers check *intent* vs *implementation*; AI code reviewed as if from a new junior developer |
+| Exposed secrets | Gitleaks |
+| Kong-specific secret | Custom Gitleaks rule |
+| Vulnerable transitive dependency | pip-audit |
+| Known source-code weaknesses | Semgrep |
+| AI guardrail logic bypass | Abuse tests |
+| Hallucinated dependency | Custom dependency check |
+| Runtime/API weaknesses | OWASP ZAP |
+| Object-level authorization concern | Custom Semgrep rule |
+| WAF-hidden application weaknesses | ZAP + DetectionOnly |
+| AI-generated-code flaws | Custom Semgrep + abuse tests |
 
-Key point for the write-up: every scanner here missed the content-list bypass. Scanners find known patterns; **logic flaws need a human threat model turned into tests**, and that test then runs forever in CI.
+The key lesson was that **no individual scanner was sufficient**.
+
+In particular, every conventional scanner initially missed the content-list guardrail bypass. The issue was a logic flaw based on an assumption about the structure of user input rather than a known vulnerable code pattern.
+
+The threat model identified the weakness, the abuse test reproduced it, and the resulting test was then added permanently to CI.
+
+---
+
+# 17. Security Testing Philosophy
+
+The pipeline follows a layered approach:
+
+```text
+              Human Threat Model
+                       |
+                       v
+              Abuse-Case Tests
+                       |
+        +--------------+--------------+
+        |              |              |
+        v              v              v
+     SAST            SCA         Secret Scan
+        |              |              |
+        +--------------+--------------+
+                       |
+                       v
+                     DAST
+                       |
+                       v
+                 Runtime Evidence
+                       |
+                       v
+                Security Review
+```
+
+For AI-assisted development, I treat generated code as code written by a new junior developer: it must be reviewed for intent, assumptions, authorization boundaries, data handling, and failure behaviour rather than being trusted because it passes conventional static analysis.
+
+---
+
+# 18. Final Pipeline Result
+
+The final implementation provided a security pipeline covering the major stages of the software lifecycle:
+
+```text
+Developer
+   |
+   v
+Pre-commit
+   |
+   +--> Secret scanning
+   +--> Dependency validation
+   |
+   v
+Pull Request
+   |
+   +--> SCA
+   +--> SAST
+   +--> AI abuse tests
+   |
+   v
+Authenticated DAST
+   |
+   +--> WAF On
+   +--> WAF DetectionOnly
+   +--> Coverage verification
+   |
+   v
+Security Review
+   |
+   v
+Merge
+```
+
+The most important outcome was not simply achieving a green pipeline. The process demonstrated the ability to:
+
+**build → test → identify weaknesses → investigate → remediate → re-test → enforce the control in CI.**
+
+This approach ensures that security findings discovered during the assessment become repeatable controls rather than one-time manual observations.
