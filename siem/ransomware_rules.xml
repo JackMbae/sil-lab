@@ -1,0 +1,28 @@
+<!--
+  Section 1B Q3: ransomware precursors - destroying recovery options before encryption (MITRE T1490).
+  Source: Sysmon Event 1 (process creation) from the Windows agent.
+  Parent 61603 = built-in "Sysmon - Event 1: Process creation". Verify with:
+    docker exec single-node-wazuh.manager-1 grep -n "Event 1:" /var/ossec/ruleset/rules/0595-win-sysmon_rules.xml
+
+  SAFE TEST (deletes nothing - echo only prints the text, but the command line contains it):
+    cmd /c echo vssadmin delete shadows /all /quiet
+-->
+<group name="ransomware,">
+
+  <rule id="100300" level="10">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)(wbadmin(\.exe)?\s+delete\s+(catalog|systemstatebackup)|bcdedit(\.exe)?\s+.*recoveryenabled\s+no|bcdedit(\.exe)?\s+.*bootstatuspolicy\s+ignoreallfailures)</field>
+    <description>Ransomware precursor: backup or boot recovery disabled by $(win.eventdata.image) on $(win.system.computer)</description>
+    <mitre><id>T1490</id></mitre>
+    <group>ransomware,inhibit_recovery,</group>
+  </rule>
+
+  <rule id="100301" level="12">
+    <if_sid>61603</if_sid>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)(vssadmin(\.exe)?\s+delete\s+shadows|wmic(\.exe)?\s+shadowcopy\s+delete|Win32_ShadowCopy.*Delete)</field>
+    <description>Ransomware precursor: volume shadow copies deleted by $(win.eventdata.image) on $(win.system.computer) - isolate the host</description>
+    <mitre><id>T1490</id></mitre>
+    <group>ransomware,inhibit_recovery,</group>
+  </rule>
+
+</group>

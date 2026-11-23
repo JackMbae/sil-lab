@@ -1,0 +1,18 @@
+<!--
+  Section 1B Q3: Shadow AI - staff using consumer AI services outside the approved guardrail proxy.
+  Source: Sysmon Event 22 (DNS query) from the Windows agent.
+  Why a custom rule: Wazuh's built-in Sysmon DNS rule is level 0, so these events were stored but never alerted.
+  Parent 61650 = built-in "Sysmon - Event 22: DNS Query". Verify on the manager with:
+    docker exec single-node-wazuh.manager-1 grep -n "Event 22" /var/ossec/ruleset/rules/0595-win-sysmon_rules.xml
+-->
+<group name="shadow_ai,">
+
+  <rule id="100200" level="10">
+    <if_sid>61650</if_sid>
+    <field name="win.eventdata.queryName" type="pcre2">(?i)(^|\.)(chatgpt\.com|openai\.com|claude\.ai|anthropic\.com|gemini\.google\.com|copilot\.microsoft\.com|perplexity\.ai|deepseek\.com|poe\.com)$</field>
+    <description>Shadow AI: $(win.eventdata.image) looked up consumer AI service $(win.eventdata.queryName)</description>
+    <mitre><id>T1567</id></mitre>
+    <group>shadow_ai,policy_violation,</group>
+  </rule>
+
+</group>

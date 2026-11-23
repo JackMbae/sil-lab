@@ -1,0 +1,20 @@
+#cloud-config
+# Runs once on first boot: installs Docker and starts Wazuh single-node (manager + indexer + dashboard).
+# __WAZUH_VERSION__ is replaced by deploy.ps1. Progress log on the VM: /var/log/cloud-init-output.log
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - git
+write_files:
+  - path: /etc/sysctl.d/99-wazuh.conf
+    content: "vm.max_map_count=262144\n"
+runcmd:
+  - sysctl --system
+  - systemctl enable --now docker
+  - usermod -aG docker azureuser
+  - git clone --depth 1 -b v__WAZUH_VERSION__ https://github.com/wazuh/wazuh-docker.git /home/azureuser/wazuh-docker
+  - cd /home/azureuser/wazuh-docker/single-node && docker compose -f generate-indexer-certs.yml run --rm generator
+  - cd /home/azureuser/wazuh-docker/single-node && docker compose up -d
+  - chown -R azureuser:azureuser /home/azureuser/wazuh-docker
+  - touch /home/azureuser/WAZUH_READY
