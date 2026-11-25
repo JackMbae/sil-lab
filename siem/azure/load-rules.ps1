@@ -18,6 +18,7 @@ docker exec $C /var/ossec/bin/wazuh-control restart >/dev/null
 sleep 5
 docker exec $C /var/ossec/bin/wazuh-control status | grep -E "analysisd|remoted"
 echo "--- logtest: AI proxy rule (expect 100402, level 8)"
-echo '{"service":"ai-proxy","event":"blocked","user":"reception-03","findings":["PHI:KE_PHONE"]}' | docker exec -i $C /var/ossec/bin/wazuh-logtest 2>&1 | grep -E "id:|level:|description:" | tail -3
+echo '{"service":"ai-proxy","event":"blocked","user":"reception-03","findings":["PHI:KE_PHONE"]}' | docker exec -i $C /var/ossec/bin/wazuh-logtest 2>&1 | grep -E "id:|level:|description:" | tail -n 3
 '@
-ssh "azureuser@$VmIp" ($remote -replace "`r", "")
+# Sent via stdin (PS 5.1 strips quotes from native args) and CRs removed (PS 5.1 pipes CRLF)
+($remote -replace "`r", "") | ssh "azureuser@$VmIp" "tr -d '\r' > /tmp/load-rules.sh && bash /tmp/load-rules.sh"
